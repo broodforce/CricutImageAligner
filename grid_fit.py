@@ -173,9 +173,24 @@ def residuals(h_lines, v_lines) -> Dict[str, float]:
             'lines': sum(l is not None for l in list(h_lines) + list(v_lines))}
 
 
-def fit_grid(image: np.ndarray, verbose: bool = False) -> Optional[dict]:
+def grid_corners_homography(corners: np.ndarray) -> np.ndarray:
+    """
+    Homography raw image -> canvas from the 4 outer grid corners (TL, TR, BR,
+    BL) in photo pixels, e.g. placed by hand in the GUI.
+    """
+    lo, hi = MARGIN, MARGIN + GRID_N * CELL
+    return cv2.getPerspectiveTransform(
+        np.float32(corners), np.float32([[lo, lo], [hi, lo], [hi, hi], [lo, hi]]))
+
+
+def fit_grid(image: np.ndarray, verbose: bool = False,
+             H_init: Optional[np.ndarray] = None) -> Optional[dict]:
     """
     Fit the mat grid in a raw photo.
+
+    H_init: optional starting homography raw image -> canvas (see
+    grid_corners_homography). When given, mat-corner detection is skipped and
+    the fit is refined from it; it must be within ~1/3" of the true grid.
 
     Returns dict with
       H       : 3x3 homography raw image -> canvas (grid at MARGIN..MARGIN+3600)
@@ -183,34 +198,41 @@ def fit_grid(image: np.ndarray, verbose: bool = False) -> Optional[dict]:
       stats   : residual statistics in canvas space
     or None if the grid could not be found.
     """
-    corners = detect_mat_corners(image)
-    if corners is None:
-        if verbose:
-            print("   ⚠️ Mat not detected")
-        return None
+    # (spacing tolerance, offset tolerance, half band) per refinement pass
+    passes = [(6, 40, 60), (6, 40, 60)]
 
-    # Pass 0: rough warp from mat corners (mat edge -> canvas edge)
-    R = ROUGH_SIZE
-    M0 = cv2.getPerspectiveTransform(
-        corners, np.float32([[0, 0], [R, 0], [R, R], [0, R]]))
-    rough = cv2.warpPerspective(image, M0, (R, R), flags=cv2.INTER_LINEAR)
+    if H_init is not None:
+        H = H_init.copy()
+        passes.insert(0, (15, 110, 120))     # hand-placed: wider first pass
+    else:
+        corners = detect_mat_corners(image)
+        if corners is None:
+            if verbose:
+                print("   ⚠️ Mat not detected")
+            return None
 
-    # Grid is ~12/13 of the mat, so spacing ~ R/13; allow wide range
-    h_lines, v_lines = _detect_in(rough, (R / 15.5, R / 12.2), (0, R // 6),
-                                  half_band=lambda s: 0.35 * s)
-    H1 = _homography_step(rough, h_lines, v_lines)
-    if H1 is None:
-        if verbose:
-            print("   ⚠️ Not enough grid lines in rough warp")
-        return None
-    H = H1 @ M0
+        # Pass 0: rough warp from mat corners (mat edge -> canvas edge)
+        R = ROUGH_SIZE
+        M0 = cv2.getPerspectiveTransform(
+            corners, np.float32([[0, 0], [R, 0], [R, R], [0, R]]))
+        rough = cv2.warpPerspective(image, M0, (R, R), flags=cv2.INTER_LINEAR)
 
-    # Pass 1..2: refine in the ideal canvas (lines now near-axis-aligned)
-    for it in range(2):
+        # Grid is ~12/13 of the mat, so spacing ~ R/13; allow wide range
+        h_lines, v_lines = _detect_in(rough, (R / 15.5, R / 12.2), (0, R // 6),
+                                      half_band=lambda s: 0.35 * s)
+        H1 = _homography_step(rough, h_lines, v_lines)
+        if H1 is None:
+            if verbose:
+                print("   ⚠️ Not enough grid lines in rough warp")
+            return None
+        H = H1 @ M0
+
+    # Refine in the ideal canvas (lines now near-axis-aligned)
+    for it, (ds, do, band) in enumerate(passes):
         canvas = cv2.warpPerspective(image, H, (CANVAS, CANVAS), flags=cv2.INTER_LINEAR)
-        h_lines, v_lines = _detect_in(canvas, (CELL - 6, CELL + 6),
-                                      (MARGIN - 40, MARGIN + 40),
-                                      half_band=lambda s: 60)
+        h_lines, v_lines = _detect_in(canvas, (CELL - ds, CELL + ds),
+                                      (MARGIN - do, MARGIN + do),
+                                      half_band=lambda s, b=band: b)
         if verbose:
             st = residuals(h_lines, v_lines)
             print(f"   Pass {it + 1}: {st['lines']}/26 lines, "
@@ -298,6 +320,21 @@ def render(image: np.ndarray, H: np.ndarray, distortion: Optional[dict] = None,
     map_y = (Hi[1, 0] * cxs + Hi[1, 1] * cys + Hi[1, 2]) / w
     return cv2.remap(image, map_x, map_y, cv2.INTER_LANCZOS4,
                      borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128))
+
+
+def canvas_to_photo(pts: np.ndarray, H: np.ndarray,
+                    distortion: Optional[dict] = None) -> np.ndarray:
+    """
+    Map ideal canvas points (N x 2) to raw photo pixels exactly as render()
+    samples them, i.e. where the model believes those grid points are.
+    """
+    x = pts[:, 0].astype(np.float64)
+    y = pts[:, 1].astype(np.float64)
+    if distortion is not None:
+        A = _poly_terms(x, y, distortion['degree'])
+        x, y = x + A @ distortion['cx'], y + A @ distortion['cy']
+    q = np.stack([x, y], axis=-1).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(q, np.linalg.inv(H)).reshape(-1, 2)
 
 
 def measure_output(output: np.ndarray) -> Dict[str, float]:

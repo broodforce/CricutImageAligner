@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from orientation import (detect_mat_corners, detect_triangle_edge, correct_orientation,
                          detect_notch_side, rotate_notch_to_top)
-from grid_fit import fit_grid, fit_distortion, render, measure_output, MARGIN, CELL
+from grid_fit import fit_grid, fit_distortion, render, measure_output, MARGIN, CELL, CANVAS
 
 OUTPUT_SIZE = 3600   # 12 inches * 300 DPI
 WARP_SIZE = 4000     # Intermediate warp size (includes mat border)
@@ -151,6 +151,86 @@ def source_dpi(H: np.ndarray) -> float:
     return float(worst)
 
 
+def align(image: np.ndarray, enable_phase2: bool = True, notch: str = 'top',
+          H_init: np.ndarray = None, verbose: bool = False) -> dict:
+    """
+    Align a loaded photo (BGR). Shared by the CLI and the GUI.
+
+    H_init: optional starting homography (photo -> canvas), e.g. from
+    hand-placed grid corners; if the refined fit then fails, H_init itself
+    is used for a homography-only render.
+
+    Returns dict with
+      result     : 3600x3600 BGR output
+      fit        : grid_fit.fit_grid() result, or None if it failed
+      H          : homography used for the render (None on the legacy fallback)
+      distortion : Phase 2 field, or None
+      qa, src_dpi: QA measurements (None on the legacy fallback)
+      warnings   : list of human-readable warnings
+    """
+    warnings = []
+
+    def warn(msg):
+        warnings.append(msg)
+        if verbose:
+            print(f"   ⚠️ {msg}")
+
+    if verbose:
+        print(f"\n2. Grid fit (13x13 lattice + homography)")
+    fit = fit_grid(image, verbose=verbose, H_init=H_init)
+
+    H, canvas, distortion = None, None, None
+    if fit is not None:
+        H, canvas = fit['H'], fit['canvas']
+    elif H_init is not None:
+        warn("Grid fit failed, using the hand-placed corners only")
+        H = H_init
+        canvas = cv2.warpPerspective(image, H, (CANVAS, CANVAS), flags=cv2.INTER_LINEAR)
+
+    if H is None:
+        warn("Grid fit failed, falling back to mat-corner crop")
+        return {'result': phase1_perspective(image, verbose=verbose), 'fit': None,
+                'H': None, 'distortion': None, 'qa': None, 'src_dpi': None,
+                'warnings': warnings}
+
+    if enable_phase2 and fit is not None:
+        if verbose:
+            print(f"\n3. Phase 2: residual distortion field")
+        distortion = fit_distortion(fit['h_lines'], fit['v_lines'])
+        if verbose:
+            print(f"   Field fit rms={distortion['fit_rms']:.2f}px")
+        if distortion['fit_rms'] > 3.0:
+            warn("Field fit poor, using homography only")
+            distortion = None
+
+    if verbose:
+        print(f"\n4. Rendering {OUTPUT_SIZE}x{OUTPUT_SIZE} (single Lanczos resample)")
+    result = render(image, H, distortion, size=OUTPUT_SIZE)
+
+    side = detect_notch_side(canvas, MARGIN, MARGIN + OUTPUT_SIZE)
+    if verbose:
+        print(f"   Notch: {side or 'not found'} → placing at {notch}")
+    result = rotate_notch_to_top(result, side)
+    if notch == 'bottom':
+        result = cv2.rotate(result, cv2.ROTATE_180)
+
+    qa = measure_output(result)
+    src = source_dpi(H)
+    if verbose:
+        print(f"\n5. QA: {qa['lines']}/26 lines, deviation rms={qa['rms']:.1f}px "
+              f"p95={qa['p95']:.1f}px max={qa['max']:.1f}px "
+              f"(1px = 1/300\")")
+        print(f"   Source resolution: ≥{src:.0f} px/inch")
+    if qa['lines'] < 20 or qa['p95'] > 6:
+        warn("Grid alignment is poor — check the output")
+    if src < 150:
+        warn(f"Low source resolution ({src:.0f} px/inch): output will be soft. "
+             "Shoot closer / overhead, or send the photo as a file, not compressed.")
+
+    return {'result': result, 'fit': fit, 'H': H, 'distortion': distortion,
+            'qa': qa, 'src_dpi': src, 'warnings': warnings}
+
+
 def process_image(input_path: str, output_path: str, dpi: int = 300,
                   verbose: bool = True, enable_phase2: bool = True,
                   notch: str = 'top') -> bool:
@@ -165,51 +245,8 @@ def process_image(input_path: str, output_path: str, dpi: int = 300,
     if verbose:
         print(f"   {w}x{h}")
 
-    if verbose:
-        print(f"\n2. Grid fit (13x13 lattice + homography)")
-    fit = fit_grid(image, verbose=verbose)
-
-    if fit is None:
-        if verbose:
-            print("   ⚠️ Grid fit failed, falling back to mat-corner crop")
-        result = phase1_perspective(image, verbose=verbose)
-    else:
-        distortion = None
-        if enable_phase2:
-            if verbose:
-                print(f"\n3. Phase 2: residual distortion field")
-            distortion = fit_distortion(fit['h_lines'], fit['v_lines'])
-            if verbose:
-                print(f"   Field fit rms={distortion['fit_rms']:.2f}px")
-            if distortion['fit_rms'] > 3.0:
-                if verbose:
-                    print("   ⚠️ Field fit poor, using homography only")
-                distortion = None
-
-        if verbose:
-            print(f"\n4. Rendering {OUTPUT_SIZE}x{OUTPUT_SIZE} (single Lanczos resample)")
-        result = render(image, fit['H'], distortion, size=OUTPUT_SIZE)
-
-        notch_target = notch
-        notch = detect_notch_side(fit['canvas'], MARGIN, MARGIN + OUTPUT_SIZE)
-        if verbose:
-            print(f"   Notch: {notch or 'not found'} → placing at {notch_target}")
-        result = rotate_notch_to_top(result, notch)
-        if notch_target == 'bottom':
-            result = cv2.rotate(result, cv2.ROTATE_180)
-
-        qa = measure_output(result)
-        src = source_dpi(fit['H'])
-        if verbose:
-            print(f"\n5. QA: {qa['lines']}/26 lines, deviation rms={qa['rms']:.1f}px "
-                  f"p95={qa['p95']:.1f}px max={qa['max']:.1f}px "
-                  f"(1px = 1/300\")")
-            print(f"   Source resolution: ≥{src:.0f} px/inch")
-            if qa['lines'] < 20 or qa['p95'] > 6:
-                print("   ⚠️ Grid alignment is poor — check the output")
-            if src < 150:
-                print(f"   ⚠️ Low source resolution ({src:.0f} px/inch): output will be soft. "
-                      "Shoot closer / overhead, or send the photo as a file, not compressed.")
+    result = align(image, enable_phase2=enable_phase2, notch=notch,
+                   verbose=verbose)['result']
 
     if verbose:
         print(f"\n6. Saving: {output_path}")
