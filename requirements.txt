@@ -1,0 +1,12 @@
+# Cricut Mat Image Rectification & Precision Grid Aligner
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+scipy>=1.7.0
+scikit-image>=0.18.0
+Pillow>=8.0.0
+exif>=0.2.0
+tkinter
+
+# Optional: For better image quality
+Pillow>=9.0.0
