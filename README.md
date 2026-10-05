@@ -54,6 +54,7 @@ python main.py -i input.jpg -o output.png --dpi 300
 | `mesh_warper.py` | Legacy per-cell refiner (no longer used) |
 | `grid_detector.py` | Legacy grid detection (no longer used) |
 | `gui.py` | Interactive GUI (optional) |
+| `pi.md` | Project specification (original requirements) |
 | `requirements.txt` | Dependencies |
 
 ## Dependencies
