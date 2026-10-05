@@ -130,6 +130,62 @@ def correct_orientation(warped: np.ndarray, triangle_edge: Optional[str]) -> np.
     return warped
 
 
+def detect_notch_side(canvas: np.ndarray, grid_lo: int, grid_hi: int) -> Optional[str]:
+    """
+    Find the triangle notch (hanging slot) in a grid-rectified canvas.
+
+    The notch is an enclosed, grey (floor-coloured) hole in the mat margin,
+    centred on one edge. Floor touching the canvas border and white mat
+    printing (logo, numbers) are rejected.
+
+    Returns: 'top', 'bottom', 'left', 'right', or None
+    """
+    size = canvas.shape[0]
+    hsv = cv2.cvtColor(canvas, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (30, 40, 40), (90, 255, 255))
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (green == 0).astype(np.uint8))
+
+    mid = size / 2
+    best, best_area = None, 0
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < 8000 or x == 0 or y == 0 or x + w >= size or y + h >= size:
+            continue
+        cx, cy = centroids[i]
+        if hsv[..., 2][labels == i].mean() > 200:       # white printing
+            continue
+        if cy < grid_lo and abs(cx - mid) < 300 and w > h:
+            side = 'top'
+        elif cy > grid_hi and abs(cx - mid) < 300 and w > h:
+            side = 'bottom'
+        elif cx < grid_lo and abs(cy - mid) < 300 and h > w:
+            side = 'left'
+        elif cx > grid_hi and abs(cy - mid) < 300 and h > w:
+            side = 'right'
+        else:
+            continue
+        if area > best_area:
+            best, best_area = side, area
+    return best
+
+
+def rotate_notch_to_top(image: np.ndarray, notch_side: Optional[str]) -> np.ndarray:
+    """Rotate so the triangle notch (hanging slot) is at the top (pi.md spec).
+
+    With the notch at the top the inch ruler reads 1..12 left-to-right along
+    the top, matching the Cricut Design Space mat view.
+    """
+    if notch_side == 'bottom':
+        return cv2.rotate(image, cv2.ROTATE_180)
+    if notch_side == 'right':
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if notch_side == 'left':
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    return image
+
+
 class MatDetector:
     """Wrapper for backward compatibility."""
     

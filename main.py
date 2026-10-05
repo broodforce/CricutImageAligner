@@ -2,8 +2,9 @@
 """
 Cricut Mat Image Rectification & Precision Grid Aligner
 
-Phase 1: Global perspective correction + grid crop + orientation fix
-Phase 2: Per-cell homography refinement (12x12 grid)
+1. Fit the 13x13 one-inch grid lattice -> homography onto ideal 300 px/inch grid
+2. Phase 2: smooth residual distortion field (lens / mat bending)
+3. Single-resample render, orientation (notch at top), QA measurement
 
 Output: 3600x3600 px PNG at 300 DPI (12x12 inches)
 """
@@ -17,8 +18,9 @@ from scipy.signal import find_peaks
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from orientation import detect_mat_corners, detect_triangle_edge, correct_orientation
-from mesh_warper import GridRefiner
+from orientation import (detect_mat_corners, detect_triangle_edge, correct_orientation,
+                         detect_notch_side, rotate_notch_to_top)
+from grid_fit import fit_grid, fit_distortion, render, measure_output, MARGIN, CELL
 
 OUTPUT_SIZE = 3600   # 12 inches * 300 DPI
 WARP_SIZE = 4000     # Intermediate warp size (includes mat border)
@@ -47,6 +49,8 @@ def save_image(image: np.ndarray, output_path: str, dpi: int = 300) -> bool:
 
 def phase1_perspective(image: np.ndarray, verbose: bool = False) -> np.ndarray:
     """
+    Legacy fallback (used only if the grid fit fails).
+
     Phase 1: Global perspective correction + grid crop + orientation.
     
     1. Detect mat corners
@@ -131,23 +135,27 @@ def phase1_perspective(image: np.ndarray, verbose: bool = False) -> np.ndarray:
     return result
 
 
-def phase2_refinement(image: np.ndarray, verbose: bool = False) -> np.ndarray:
-    """
-    Phase 2: Per-cell homography refinement.
-    
-    Splits 3600x3600 into 12x12 cells of 300x300px.
-    Detects actual grid line positions, applies local corrections.
-    """
-    if verbose:
-        print("   Refining 12x12 grid cells...")
-    refiner = GridRefiner(image, cell_size=300, grid_n=12)
-    return refiner.refine(verbose=verbose)
+def source_dpi(H: np.ndarray) -> float:
+    """Lowest effective source resolution (photo px per inch) over the grid."""
+    Hi = np.linalg.inv(H)
+    worst = np.inf
+    for gx in range(0, 13, 3):
+        for gy in range(0, 13, 3):
+            p = np.float32([[[MARGIN + gx * CELL, MARGIN + gy * CELL]],
+                            [[MARGIN + gx * CELL + 1, MARGIN + gy * CELL]],
+                            [[MARGIN + gx * CELL, MARGIN + gy * CELL + 1]]])
+            q = cv2.perspectiveTransform(p, Hi).reshape(3, 2)
+            sx = np.linalg.norm(q[1] - q[0])
+            sy = np.linalg.norm(q[2] - q[0])
+            worst = min(worst, min(sx, sy) * CELL)
+    return float(worst)
 
 
 def process_image(input_path: str, output_path: str, dpi: int = 300,
-                  verbose: bool = True, enable_phase2: bool = True) -> bool:
+                  verbose: bool = True, enable_phase2: bool = True,
+                  notch: str = 'top') -> bool:
     """Full pipeline."""
-    
+
     if verbose:
         print(f"\n1. Loading: {os.path.basename(input_path)}")
     image = load_image(input_path)
@@ -156,24 +164,60 @@ def process_image(input_path: str, output_path: str, dpi: int = 300,
     h, w = image.shape[:2]
     if verbose:
         print(f"   {w}x{h}")
-    
+
     if verbose:
-        print(f"\n2. Phase 1: Perspective + grid crop")
-    result = phase1_perspective(image, verbose=verbose)
-    
-    if enable_phase2:
+        print(f"\n2. Grid fit (13x13 lattice + homography)")
+    fit = fit_grid(image, verbose=verbose)
+
+    if fit is None:
         if verbose:
-            print(f"\n3. Phase 2: Per-cell refinement")
-        result = phase2_refinement(result, verbose=verbose)
-    
+            print("   ⚠️ Grid fit failed, falling back to mat-corner crop")
+        result = phase1_perspective(image, verbose=verbose)
+    else:
+        distortion = None
+        if enable_phase2:
+            if verbose:
+                print(f"\n3. Phase 2: residual distortion field")
+            distortion = fit_distortion(fit['h_lines'], fit['v_lines'])
+            if verbose:
+                print(f"   Field fit rms={distortion['fit_rms']:.2f}px")
+            if distortion['fit_rms'] > 3.0:
+                if verbose:
+                    print("   ⚠️ Field fit poor, using homography only")
+                distortion = None
+
+        if verbose:
+            print(f"\n4. Rendering {OUTPUT_SIZE}x{OUTPUT_SIZE} (single Lanczos resample)")
+        result = render(image, fit['H'], distortion, size=OUTPUT_SIZE)
+
+        notch_target = notch
+        notch = detect_notch_side(fit['canvas'], MARGIN, MARGIN + OUTPUT_SIZE)
+        if verbose:
+            print(f"   Notch: {notch or 'not found'} → placing at {notch_target}")
+        result = rotate_notch_to_top(result, notch)
+        if notch_target == 'bottom':
+            result = cv2.rotate(result, cv2.ROTATE_180)
+
+        qa = measure_output(result)
+        src = source_dpi(fit['H'])
+        if verbose:
+            print(f"\n5. QA: {qa['lines']}/26 lines, deviation rms={qa['rms']:.1f}px "
+                  f"p95={qa['p95']:.1f}px max={qa['max']:.1f}px "
+                  f"(1px = 1/300\")")
+            print(f"   Source resolution: ≥{src:.0f} px/inch")
+            if qa['lines'] < 20 or qa['p95'] > 6:
+                print("   ⚠️ Grid alignment is poor — check the output")
+            if src < 150:
+                print(f"   ⚠️ Low source resolution ({src:.0f} px/inch): output will be soft. "
+                      "Shoot closer / overhead, or send the photo as a file, not compressed.")
+
     if verbose:
-        step = '4' if enable_phase2 else '3'
-        print(f"\n{step}. Saving: {output_path}")
-    
+        print(f"\n6. Saving: {output_path}")
+
     out_dir = os.path.dirname(output_path)
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
-    
+
     if save_image(result, output_path, dpi):
         if verbose:
             size_kb = os.path.getsize(output_path) / 1024
@@ -188,7 +232,9 @@ def main():
     parser.add_argument('-i', '--input', required=True, help='Input image path')
     parser.add_argument('-o', '--output', required=True, help='Output image path')
     parser.add_argument('--dpi', type=int, default=300, help='Output DPI (default: 300)')
-    parser.add_argument('--no-phase2', action='store_true', help='Skip per-cell refinement')
+    parser.add_argument('--notch', choices=['top', 'bottom'], default='top',
+                        help='Where the triangle notch ends up (default: top, per spec)')
+    parser.add_argument('--no-phase2', action='store_true', help='Skip residual distortion correction (homography only)')
     
     args = parser.parse_args()
     
@@ -197,7 +243,7 @@ def main():
     print("=" * 60)
     
     success = process_image(args.input, args.output, dpi=args.dpi,
-                            enable_phase2=not args.no_phase2)
+                            enable_phase2=not args.no_phase2, notch=args.notch)
     
     print("\n" + "=" * 60)
     print(f"  {'✓ Success!' if success else '✗ Failed'}")

@@ -6,7 +6,7 @@ scipy>=1.7.0
 scikit-image>=0.18.0
 Pillow>=8.0.0
 exif>=0.2.0
-tkinter
+pytest>=7.0
 
 # Optional: For better image quality
 Pillow>=9.0.0
