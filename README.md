@@ -3,6 +3,14 @@
 Takes photos of artwork on a Cricut 12×12" mat and produces a perspective-corrected, 
 grid-aligned 3600×3600 px (300 DPI) square PNG for Cricut Design Space.
 
+## Examples
+
+| Input photo | Output (3600×3600, 300 DPI) |
+|:-----------:|:---------------------------:|
+| <img src="Examples/Image1.jpeg" width="400"> | <img src="Examples/Output/output1.png" width="400"> |
+| <img src="Examples/Image2.jpeg" width="400"> | <img src="Examples/Output/output2.png" width="400"> |
+| <img src="Examples/Image3.jpeg" width="400"> | <img src="Examples/Output/output3.png" width="400"> |
+
 ## Pipeline
 
 1. **Rough warp** - HSV mat mask + 4 mat corners → 4000×4000 (initialisation only)
